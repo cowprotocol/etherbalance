@@ -6,13 +6,22 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      AUTODEPLOY_TAG: develop
-      AUTODEPLOY_URL: ${{ secrets.AUTODEPLOY_URL }}
-      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-      REGISTRY_URI: "gnosispm/etherbalance"
     steps:
-      - uses: actions/checkout@v2
-      - name: Deploy
-        run: docker/deploy.sh ${GITHUB_REF#refs/*/}
+      - uses: actions/checkout@v3
+      - uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v3
+        with:
+          images: ghcr.io/${{ github.repository }}
+      - name: Image build
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
