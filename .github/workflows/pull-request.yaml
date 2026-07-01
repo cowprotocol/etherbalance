@@ -9,8 +9,8 @@ jobs:
   rust-misc:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: Swatinem/rust-cache@v1
+      - uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2
+      - uses: Swatinem/rust-cache@81d053bdb0871dcd3f10763c8cc60d0adc41762b # v1
       - run: |
           rustup --version
           rustup show
@@ -22,7 +22,7 @@ jobs:
   rust-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: Swatinem/rust-cache@v1
+      - uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2
+      - uses: Swatinem/rust-cache@81d053bdb0871dcd3f10763c8cc60d0adc41762b # v1
       - run: cargo build --locked --all-features --tests
       - run: cargo test --locked --all-features
