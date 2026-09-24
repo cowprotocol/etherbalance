@@ -158,7 +158,7 @@ fn create_addresses_to_monitor(
                     tokens
                         .get(name)
                         .ok_or_else(|| anyhow!("token named {} not found", name))
-                        .map(|token| token.clone())
+                        .cloned()
                 })
                 .collect();
             Ok(AddressToMonitor {

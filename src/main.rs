@@ -141,10 +141,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ])
                             .inc();
                         println!(
-                            "failed to get balance for address {} token {}: {}",
-                            &format!("{:#x}", params.address),
-                            params.token_name,
-                            err
+                            "failed to get balance for address {:#x} token {}: {}",
+                            params.address, params.token_name, err
                         );
                     }
                 }
