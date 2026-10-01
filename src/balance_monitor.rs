@@ -1,7 +1,7 @@
 use crate::config;
 use anyhow::{anyhow, Context, Error, Result};
 use ethcontract::dyns::DynTransport;
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, rc::Rc, str::FromStr};
 use url::Url;
 use web3::{
     error::Error as Web3Error,
@@ -18,7 +18,7 @@ pub struct BalanceMonitor {
 pub struct CallbackParameters<'a> {
     pub network_name: &'a str,
     pub address_name: &'a str,
-    pub address: &'a Address,
+    pub address: &'a AccountAddress,
     pub token_name: &'a str,
     pub balance: Result<U256>,
     pub tag: &'a str,
@@ -39,19 +39,7 @@ impl BalanceMonitor {
         let networks = config
             .networks
             .into_iter()
-            .map(|network| {
-                let url: Url = network.url.parse().context("invalid url")?;
-                let transport =
-                    create_transport(&url).context("failed to create transport from node uri")?;
-                let web3 = web3::Web3::new(transport);
-                let tokens = create_tokens(network.tokens, &web3);
-                let addresses = create_addresses_to_monitor(network.addresses, &tokens)?;
-                Ok(Network {
-                    name: network.name,
-                    web3,
-                    addresses,
-                })
-            })
+            .map(create_network)
             .collect::<Result<_>>()?;
         Ok(Self { networks })
     }
@@ -65,18 +53,22 @@ impl BalanceMonitor {
         for network in &self.networks {
             for address in &network.addresses {
                 if address.monitor_ether {
-                    let balance = ether_balance(address.address, &network.web3.eth()).await;
+                    let (token_name, balance) =
+                        network.client.native_balance(&address.address).await;
                     callback(CallbackParameters {
                         network_name: &network.name,
                         address_name: &address.name,
                         address: &address.address,
-                        token_name: "ether",
-                        balance: balance.map_err(Error::new),
+                        token_name,
+                        balance,
                         tag: &address.tag,
                     });
                 }
                 for token in &address.tokens {
-                    let balance = erc20_balance(&token.contract, address.address).await;
+                    let AccountAddress::Evm(account) = address.address else {
+                        unreachable!("tokens are only configured for evm addresses")
+                    };
+                    let balance = erc20_balance(&token.contract, account).await;
                     callback(CallbackParameters {
                         network_name: &network.name,
                         address_name: &address.name,
@@ -102,11 +94,82 @@ fn create_transport(url: &Url) -> Result<DynTransport> {
     }
 }
 
+fn create_network(network: config::Network) -> Result<Network> {
+    let url: Url = network.url.parse().context("invalid url")?;
+    let transport = create_transport(&url).context("failed to create transport from node uri")?;
+    let (client, addresses) = match network.kind {
+        config::Kind::Evm => {
+            let web3 = web3::Web3::new(transport);
+            let tokens = create_tokens(network.tokens, &web3);
+            let addresses = create_addresses_to_monitor(network.addresses, &tokens)?;
+            (Client::Evm(web3), addresses)
+        }
+        config::Kind::Solana => {
+            if !network.tokens.is_empty() {
+                return Err(anyhow!(
+                    "network {} is a solana network, tokens are not supported",
+                    network.name
+                ));
+            }
+            let addresses = create_solana_addresses_to_monitor(network.addresses)?;
+            (Client::Solana(transport), addresses)
+        }
+    };
+    Ok(Network {
+        name: network.name,
+        client,
+        addresses,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct Network {
     name: String,
-    web3: web3::Web3<DynTransport>,
+    client: Client,
     addresses: Vec<AddressToMonitor>,
+}
+
+#[derive(Clone, Debug)]
+enum Client {
+    Evm(web3::Web3<DynTransport>),
+    /// Solana nodes speak JSON-RPC too, so the web3 transport is reused to send
+    /// raw Solana requests.
+    Solana(DynTransport),
+}
+
+impl Client {
+    /// The native balance of an address together with its token name.
+    async fn native_balance(&self, address: &AccountAddress) -> (&'static str, Result<U256>) {
+        match (self, address) {
+            (Client::Evm(web3), AccountAddress::Evm(address)) => (
+                "ether",
+                ether_balance(*address, &web3.eth())
+                    .await
+                    .map_err(Error::new),
+            ),
+            (Client::Solana(transport), AccountAddress::Solana(address)) => {
+                ("sol", solana_balance(transport, address).await)
+            }
+            // Addresses are created from their network's config in create_network.
+            _ => unreachable!("address kind always matches its network kind"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum AccountAddress {
+    Evm(Address),
+    Solana(SolanaAddress),
+}
+
+impl AccountAddress {
+    /// The address as it appears in the prometheus "address" label.
+    pub fn label(&self) -> String {
+        match self {
+            AccountAddress::Evm(address) => format!("{:#x}", address),
+            AccountAddress::Solana(address) => address.0.clone(),
+        }
+    }
 }
 
 ethcontract::contract!("contracts/IERC20.json");
@@ -120,7 +183,7 @@ struct Token {
 #[derive(Clone, Debug)]
 struct AddressToMonitor {
     name: String,
-    address: Address,
+    address: AccountAddress,
     monitor_ether: bool,
     tokens: Vec<Rc<Token>>,
     tag: String,
@@ -161,15 +224,68 @@ fn create_addresses_to_monitor(
                         .cloned()
                 })
                 .collect();
+            let address = config::hex_string_to_address(&config_address.address)
+                .with_context(|| format!("failed to parse address of {}", name))?;
             Ok(AddressToMonitor {
                 name,
-                address: config_address.address.0,
+                address: AccountAddress::Evm(address),
                 monitor_ether: config_address.ether,
                 tokens: tokens?,
                 tag: config_address.tag.unwrap_or_default(),
             })
         })
         .collect()
+}
+
+fn create_solana_addresses_to_monitor(
+    addresses: HashMap<String, config::ConfigAddress>,
+) -> Result<Vec<AddressToMonitor>> {
+    addresses
+        .into_iter()
+        .map(|(name, config_address)| {
+            if !config_address.tokens.is_empty() {
+                return Err(anyhow!(
+                    "address {} is on a solana network, tokens are not supported",
+                    name
+                ));
+            }
+            let address = config_address
+                .address
+                .parse()
+                .with_context(|| format!("failed to parse address of {}", name))?;
+            Ok(AddressToMonitor {
+                name,
+                address: AccountAddress::Solana(address),
+                monitor_ether: config_address.ether,
+                tokens: Vec::new(),
+                tag: config_address.tag.unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// A base58 encoded Solana address, only constructed after checking it decodes
+/// to 32 bytes. The original string is kept because both the RPC and the
+/// prometheus label use it.
+#[derive(Clone, Debug)]
+pub struct SolanaAddress(String);
+
+impl FromStr for SolanaAddress {
+    type Err = Error;
+
+    fn from_str(address: &str) -> Result<Self> {
+        let bytes = bs58::decode(address)
+            .into_vec()
+            .with_context(|| format!("\"{}\" is not base58", address))?;
+        if bytes.len() != 32 {
+            return Err(anyhow!(
+                "\"{}\" decodes to {} bytes instead of 32",
+                address,
+                bytes.len()
+            ));
+        }
+        Ok(Self(address.to_owned()))
+    }
 }
 
 async fn ether_balance(
@@ -184,4 +300,39 @@ async fn erc20_balance(
     address: Address,
 ) -> Result<U256, ethcontract::errors::MethodError> {
     contract.balance_of(address).call().await
+}
+
+/// The SOL balance of an account in lamports.
+async fn solana_balance(transport: &DynTransport, address: &SolanaAddress) -> Result<U256> {
+    let response = transport
+        .execute(
+            "getBalance",
+            vec![
+                serde_json::json!(address.0),
+                serde_json::json!({ "commitment": "confirmed" }),
+            ],
+        )
+        .await?;
+    let lamports = response["value"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("unexpected getBalance response: {}", response))?;
+    Ok(U256::from(lamports))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_solana_addresses() {
+        assert!("Grr6SWYUFi1eCagwEifXVD83rUQ4W5rJWYq1Lj7cx1jS"
+            .parse::<SolanaAddress>()
+            .is_ok());
+        // Not base58 (contains 0).
+        assert!("0rr6SWYUFi1eCagwEifXVD83rUQ4W5rJWYq1Lj7cx1jS"
+            .parse::<SolanaAddress>()
+            .is_err());
+        // Valid base58 but too short.
+        assert!("Grr6SWYUFi1eCagw".parse::<SolanaAddress>().is_err());
+    }
 }
