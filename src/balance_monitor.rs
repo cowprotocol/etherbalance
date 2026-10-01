@@ -1,7 +1,7 @@
 use crate::config;
 use anyhow::{anyhow, Context, Error, Result};
 use ethcontract::dyns::DynTransport;
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, rc::Rc, str::FromStr};
 use url::Url;
 use web3::{
     error::Error as Web3Error,
@@ -159,7 +159,7 @@ impl Client {
 #[derive(Clone, Debug)]
 pub enum AccountAddress {
     Evm(Address),
-    Solana(String),
+    Solana(SolanaAddress),
 }
 
 impl AccountAddress {
@@ -167,7 +167,7 @@ impl AccountAddress {
     pub fn label(&self) -> String {
         match self {
             AccountAddress::Evm(address) => format!("{:#x}", address),
-            AccountAddress::Solana(address) => address.clone(),
+            AccountAddress::Solana(address) => address.0.clone(),
         }
     }
 }
@@ -249,11 +249,13 @@ fn create_solana_addresses_to_monitor(
                     name
                 ));
             }
-            validate_solana_address(&config_address.address)
+            let address = config_address
+                .address
+                .parse()
                 .with_context(|| format!("failed to parse address of {}", name))?;
             Ok(AddressToMonitor {
                 name,
-                address: AccountAddress::Solana(config_address.address),
+                address: AccountAddress::Solana(address),
                 monitor_ether: config_address.ether,
                 tokens: Vec::new(),
                 tag: config_address.tag.unwrap_or_default(),
@@ -262,18 +264,28 @@ fn create_solana_addresses_to_monitor(
         .collect()
 }
 
-fn validate_solana_address(address: &str) -> Result<()> {
-    let bytes = bs58::decode(address)
-        .into_vec()
-        .with_context(|| format!("\"{}\" is not base58", address))?;
-    if bytes.len() != 32 {
-        return Err(anyhow!(
-            "\"{}\" decodes to {} bytes instead of 32",
-            address,
-            bytes.len()
-        ));
+/// A base58 encoded Solana address, only constructed after checking it decodes
+/// to 32 bytes. The original string is kept because both the RPC and the
+/// prometheus label use it.
+#[derive(Clone, Debug)]
+pub struct SolanaAddress(String);
+
+impl FromStr for SolanaAddress {
+    type Err = Error;
+
+    fn from_str(address: &str) -> Result<Self> {
+        let bytes = bs58::decode(address)
+            .into_vec()
+            .with_context(|| format!("\"{}\" is not base58", address))?;
+        if bytes.len() != 32 {
+            return Err(anyhow!(
+                "\"{}\" decodes to {} bytes instead of 32",
+                address,
+                bytes.len()
+            ));
+        }
+        Ok(Self(address.to_owned()))
     }
-    Ok(())
 }
 
 async fn ether_balance(
@@ -291,12 +303,12 @@ async fn erc20_balance(
 }
 
 /// The SOL balance of an account in lamports.
-async fn solana_balance(transport: &DynTransport, address: &str) -> Result<U256> {
+async fn solana_balance(transport: &DynTransport, address: &SolanaAddress) -> Result<U256> {
     let response = transport
         .execute(
             "getBalance",
             vec![
-                serde_json::json!(address),
+                serde_json::json!(address.0),
                 serde_json::json!({ "commitment": "confirmed" }),
             ],
         )
@@ -312,11 +324,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_solana_addresses() {
-        assert!(validate_solana_address("Grr6SWYUFi1eCagwEifXVD83rUQ4W5rJWYq1Lj7cx1jS").is_ok());
+    fn parses_solana_addresses() {
+        assert!("Grr6SWYUFi1eCagwEifXVD83rUQ4W5rJWYq1Lj7cx1jS"
+            .parse::<SolanaAddress>()
+            .is_ok());
         // Not base58 (contains 0).
-        assert!(validate_solana_address("0rr6SWYUFi1eCagwEifXVD83rUQ4W5rJWYq1Lj7cx1jS").is_err());
+        assert!("0rr6SWYUFi1eCagwEifXVD83rUQ4W5rJWYq1Lj7cx1jS"
+            .parse::<SolanaAddress>()
+            .is_err());
         // Valid base58 but too short.
-        assert!(validate_solana_address("Grr6SWYUFi1eCagw").is_err());
+        assert!("Grr6SWYUFi1eCagw".parse::<SolanaAddress>().is_err());
     }
 }
