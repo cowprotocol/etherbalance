@@ -39,34 +39,7 @@ impl BalanceMonitor {
         let networks = config
             .networks
             .into_iter()
-            .map(|network| {
-                let url: Url = network.url.parse().context("invalid url")?;
-                let transport =
-                    create_transport(&url).context("failed to create transport from node uri")?;
-                let (client, addresses) = match network.kind {
-                    config::Kind::Evm => {
-                        let web3 = web3::Web3::new(transport);
-                        let tokens = create_tokens(network.tokens, &web3);
-                        let addresses = create_addresses_to_monitor(network.addresses, &tokens)?;
-                        (Client::Evm(web3), addresses)
-                    }
-                    config::Kind::Solana => {
-                        if !network.tokens.is_empty() {
-                            return Err(anyhow!(
-                                "network {} is a solana network, tokens are not supported",
-                                network.name
-                            ));
-                        }
-                        let addresses = create_solana_addresses_to_monitor(network.addresses)?;
-                        (Client::Solana(transport), addresses)
-                    }
-                };
-                Ok(Network {
-                    name: network.name,
-                    client,
-                    addresses,
-                })
-            })
+            .map(create_network)
             .collect::<Result<_>>()?;
         Ok(Self { networks })
     }
@@ -80,18 +53,8 @@ impl BalanceMonitor {
         for network in &self.networks {
             for address in &network.addresses {
                 if address.monitor_ether {
-                    let (token_name, balance) = match (&network.client, &address.address) {
-                        (Client::Evm(web3), AccountAddress::Evm(account)) => (
-                            "ether",
-                            ether_balance(*account, &web3.eth())
-                                .await
-                                .map_err(Error::new),
-                        ),
-                        (Client::Solana(transport), AccountAddress::Solana(account)) => {
-                            ("sol", solana_balance(transport, account).await)
-                        }
-                        _ => unreachable!("address kind always matches its network kind"),
-                    };
+                    let (token_name, balance) =
+                        network.client.native_balance(&address.address).await;
                     callback(CallbackParameters {
                         network_name: &network.name,
                         address_name: &address.name,
@@ -131,6 +94,34 @@ fn create_transport(url: &Url) -> Result<DynTransport> {
     }
 }
 
+fn create_network(network: config::Network) -> Result<Network> {
+    let url: Url = network.url.parse().context("invalid url")?;
+    let transport = create_transport(&url).context("failed to create transport from node uri")?;
+    let (client, addresses) = match network.kind {
+        config::Kind::Evm => {
+            let web3 = web3::Web3::new(transport);
+            let tokens = create_tokens(network.tokens, &web3);
+            let addresses = create_addresses_to_monitor(network.addresses, &tokens)?;
+            (Client::Evm(web3), addresses)
+        }
+        config::Kind::Solana => {
+            if !network.tokens.is_empty() {
+                return Err(anyhow!(
+                    "network {} is a solana network, tokens are not supported",
+                    network.name
+                ));
+            }
+            let addresses = create_solana_addresses_to_monitor(network.addresses)?;
+            (Client::Solana(transport), addresses)
+        }
+    };
+    Ok(Network {
+        name: network.name,
+        client,
+        addresses,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct Network {
     name: String,
@@ -144,6 +135,25 @@ enum Client {
     /// Solana nodes speak JSON-RPC too, so the web3 transport is reused to send
     /// raw Solana requests.
     Solana(DynTransport),
+}
+
+impl Client {
+    /// The native balance of an address together with its token name.
+    async fn native_balance(&self, address: &AccountAddress) -> (&'static str, Result<U256>) {
+        match (self, address) {
+            (Client::Evm(web3), AccountAddress::Evm(address)) => (
+                "ether",
+                ether_balance(*address, &web3.eth())
+                    .await
+                    .map_err(Error::new),
+            ),
+            (Client::Solana(transport), AccountAddress::Solana(address)) => {
+                ("sol", solana_balance(transport, address).await)
+            }
+            // Addresses are created from their network's config in create_network.
+            _ => unreachable!("address kind always matches its network kind"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
