@@ -18,7 +18,7 @@ pub struct BalanceMonitor {
 pub struct CallbackParameters<'a> {
     pub network_name: &'a str,
     pub address_name: &'a str,
-    pub address: &'a Address,
+    pub address: &'a AccountAddress,
     pub token_name: &'a str,
     pub balance: Result<U256>,
     pub tag: &'a str,
@@ -43,12 +43,27 @@ impl BalanceMonitor {
                 let url: Url = network.url.parse().context("invalid url")?;
                 let transport =
                     create_transport(&url).context("failed to create transport from node uri")?;
-                let web3 = web3::Web3::new(transport);
-                let tokens = create_tokens(network.tokens, &web3);
-                let addresses = create_addresses_to_monitor(network.addresses, &tokens)?;
+                let (client, addresses) = match network.kind {
+                    config::Kind::Evm => {
+                        let web3 = web3::Web3::new(transport);
+                        let tokens = create_tokens(network.tokens, &web3);
+                        let addresses = create_addresses_to_monitor(network.addresses, &tokens)?;
+                        (Client::Evm(web3), addresses)
+                    }
+                    config::Kind::Solana => {
+                        if !network.tokens.is_empty() {
+                            return Err(anyhow!(
+                                "network {} is a solana network, tokens are not supported",
+                                network.name
+                            ));
+                        }
+                        let addresses = create_solana_addresses_to_monitor(network.addresses)?;
+                        (Client::Solana(transport), addresses)
+                    }
+                };
                 Ok(Network {
                     name: network.name,
-                    web3,
+                    client,
                     addresses,
                 })
             })
@@ -65,18 +80,32 @@ impl BalanceMonitor {
         for network in &self.networks {
             for address in &network.addresses {
                 if address.monitor_ether {
-                    let balance = ether_balance(address.address, &network.web3.eth()).await;
+                    let (token_name, balance) = match (&network.client, &address.address) {
+                        (Client::Evm(web3), AccountAddress::Evm(account)) => (
+                            "ether",
+                            ether_balance(*account, &web3.eth())
+                                .await
+                                .map_err(Error::new),
+                        ),
+                        (Client::Solana(transport), AccountAddress::Solana(account)) => {
+                            ("sol", solana_balance(transport, account).await)
+                        }
+                        _ => unreachable!("address kind always matches its network kind"),
+                    };
                     callback(CallbackParameters {
                         network_name: &network.name,
                         address_name: &address.name,
                         address: &address.address,
-                        token_name: "ether",
-                        balance: balance.map_err(Error::new),
+                        token_name,
+                        balance,
                         tag: &address.tag,
                     });
                 }
                 for token in &address.tokens {
-                    let balance = erc20_balance(&token.contract, address.address).await;
+                    let AccountAddress::Evm(account) = address.address else {
+                        unreachable!("tokens are only configured for evm addresses")
+                    };
+                    let balance = erc20_balance(&token.contract, account).await;
                     callback(CallbackParameters {
                         network_name: &network.name,
                         address_name: &address.name,
@@ -105,8 +134,32 @@ fn create_transport(url: &Url) -> Result<DynTransport> {
 #[derive(Clone, Debug)]
 struct Network {
     name: String,
-    web3: web3::Web3<DynTransport>,
+    client: Client,
     addresses: Vec<AddressToMonitor>,
+}
+
+#[derive(Clone, Debug)]
+enum Client {
+    Evm(web3::Web3<DynTransport>),
+    /// Solana nodes speak JSON-RPC too, so the web3 transport is reused to send
+    /// raw Solana requests.
+    Solana(DynTransport),
+}
+
+#[derive(Clone, Debug)]
+pub enum AccountAddress {
+    Evm(Address),
+    Solana(String),
+}
+
+impl AccountAddress {
+    /// The address as it appears in the prometheus "address" label.
+    pub fn label(&self) -> String {
+        match self {
+            AccountAddress::Evm(address) => format!("{:#x}", address),
+            AccountAddress::Solana(address) => address.clone(),
+        }
+    }
 }
 
 ethcontract::contract!("contracts/IERC20.json");
@@ -120,7 +173,7 @@ struct Token {
 #[derive(Clone, Debug)]
 struct AddressToMonitor {
     name: String,
-    address: Address,
+    address: AccountAddress,
     monitor_ether: bool,
     tokens: Vec<Rc<Token>>,
     tag: String,
@@ -161,15 +214,56 @@ fn create_addresses_to_monitor(
                         .cloned()
                 })
                 .collect();
+            let address = config::hex_string_to_address(&config_address.address)
+                .with_context(|| format!("failed to parse address of {}", name))?;
             Ok(AddressToMonitor {
                 name,
-                address: config_address.address.0,
+                address: AccountAddress::Evm(address),
                 monitor_ether: config_address.ether,
                 tokens: tokens?,
                 tag: config_address.tag.unwrap_or_default(),
             })
         })
         .collect()
+}
+
+fn create_solana_addresses_to_monitor(
+    addresses: HashMap<String, config::ConfigAddress>,
+) -> Result<Vec<AddressToMonitor>> {
+    addresses
+        .into_iter()
+        .map(|(name, config_address)| {
+            if !config_address.tokens.is_empty() {
+                return Err(anyhow!(
+                    "address {} is on a solana network, tokens are not supported",
+                    name
+                ));
+            }
+            validate_solana_address(&config_address.address)
+                .with_context(|| format!("failed to parse address of {}", name))?;
+            Ok(AddressToMonitor {
+                name,
+                address: AccountAddress::Solana(config_address.address),
+                monitor_ether: config_address.ether,
+                tokens: Vec::new(),
+                tag: config_address.tag.unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn validate_solana_address(address: &str) -> Result<()> {
+    let bytes = bs58::decode(address)
+        .into_vec()
+        .with_context(|| format!("\"{}\" is not base58", address))?;
+    if bytes.len() != 32 {
+        return Err(anyhow!(
+            "\"{}\" decodes to {} bytes instead of 32",
+            address,
+            bytes.len()
+        ));
+    }
+    Ok(())
 }
 
 async fn ether_balance(
@@ -184,4 +278,35 @@ async fn erc20_balance(
     address: Address,
 ) -> Result<U256, ethcontract::errors::MethodError> {
     contract.balance_of(address).call().await
+}
+
+/// The SOL balance of an account in lamports.
+async fn solana_balance(transport: &DynTransport, address: &str) -> Result<U256> {
+    let response = transport
+        .execute(
+            "getBalance",
+            vec![
+                serde_json::json!(address),
+                serde_json::json!({ "commitment": "confirmed" }),
+            ],
+        )
+        .await?;
+    let lamports = response["value"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("unexpected getBalance response: {}", response))?;
+    Ok(U256::from(lamports))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_solana_addresses() {
+        assert!(validate_solana_address("Grr6SWYUFi1eCagwEifXVD83rUQ4W5rJWYq1Lj7cx1jS").is_ok());
+        // Not base58 (contains 0).
+        assert!(validate_solana_address("0rr6SWYUFi1eCagwEifXVD83rUQ4W5rJWYq1Lj7cx1jS").is_err());
+        // Valid base58 but too short.
+        assert!(validate_solana_address("Grr6SWYUFi1eCagw").is_err());
+    }
 }

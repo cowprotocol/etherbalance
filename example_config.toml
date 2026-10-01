@@ -31,3 +31,16 @@ url = 'http://rinkeby.node'
 
 [networks.addresses]
 personal-wallet-rinkeby = { address = "0xbe0eb53f46cd790cd13851d5eff43d12404d33e8", ether=true, tokens = [] }
+
+[[networks]]
+# `kind` defaults to 'evm'. Solana networks only support native SOL balances
+# (reported in lamports with token_name "sol"), so `tokens` must be empty.
+name = 'solana'
+kind = 'solana'
+url = 'https://api.mainnet-beta.solana.com'
+
+[networks.tokens]
+
+[networks.addresses]
+# Solana addresses are base58 encoded.
+solana-wallet = { address = "Grr6SWYUFi1eCagwEifXVD83rUQ4W5rJWYq1Lj7cx1jS", ether=true, tokens = [] }
