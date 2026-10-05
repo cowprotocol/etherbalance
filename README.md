@@ -1,6 +1,7 @@
 # etherbalance
 
 An ethereum ether and [ERC20](https://eips.ethereum.org/EIPS/eip-20) token balance monitoring application.
+It can also monitor native SOL balances on Solana networks (`kind = 'solana'`), reported in lamports with `token_name="sol"`.
 
 See the [example config file](example_config.toml), and command line options (`cargo run -- --help`):
 

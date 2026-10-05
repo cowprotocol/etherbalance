@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let balance_metric = prometheus::GaugeVec::new(
         prometheus::Opts::new(
             "etherbalance_balance",
-            "The ether or IERC20 balance of an ethereum address.",
+            "The native (ether, SOL) or IERC20 balance of an address.",
         ),
         &["address_name", "token_name", "address", "tag", "network"],
     )?;
@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .with_label_values(&[
                                 params.address_name,
                                 params.token_name,
-                                &format!("{:#x}", params.address),
+                                &params.address.label(),
                                 params.tag,
                                 params.network_name,
                             ])
@@ -127,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         success_metric
                             .with_label_values(&[
                                 "success",
-                                &format!("{:#x}", params.address),
+                                &params.address.label(),
                                 params.network_name,
                             ])
                             .inc();
@@ -136,13 +136,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         success_metric
                             .with_label_values(&[
                                 "failure",
-                                &format!("{:#x}", params.address),
+                                &params.address.label(),
                                 params.network_name,
                             ])
                             .inc();
                         println!(
-                            "failed to get balance for address {:#x} token {}: {}",
-                            params.address, params.token_name, err
+                            "failed to get balance for address {} token {}: {}",
+                            params.address.label(),
+                            params.token_name,
+                            err
                         );
                     }
                 }
