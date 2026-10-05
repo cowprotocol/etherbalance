@@ -1,4 +1,4 @@
-FROM docker.io/rust:1-slim-bullseye as cargo-build
+FROM docker.io/rust:1-slim-trixie as cargo-build
 WORKDIR /usr/local/src/etherbalance
 
 # Install dependencies
@@ -9,7 +9,7 @@ COPY . .
 RUN CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release
 
 # Extract Binary
-FROM docker.io/debian:bullseye-slim
+FROM docker.io/debian:trixie-slim
 
 # Handle signal handlers properly
 RUN apt-get update && apt-get install -y ca-certificates tini && apt-get clean
