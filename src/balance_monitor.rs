@@ -1,5 +1,6 @@
-use crate::config;
+use crate::{config, order_monitor};
 use anyhow::{anyhow, Context, Error, Result};
+use cow_settlement_interface::Pubkey;
 use ethcontract::dyns::DynTransport;
 use std::{collections::HashMap, rc::Rc, str::FromStr};
 use url::Url;
@@ -22,6 +23,13 @@ pub struct CallbackParameters<'a> {
     pub token_name: &'a str,
     pub balance: Result<U256>,
     pub tag: &'a str,
+}
+
+#[derive(Debug)]
+pub struct OrderStatsCallbackParameters<'a> {
+    pub network_name: &'a str,
+    pub program_id: &'a Pubkey,
+    pub stats: Result<order_monitor::Stats>,
 }
 
 impl BalanceMonitor {
@@ -81,6 +89,29 @@ impl BalanceMonitor {
             }
         }
     }
+
+    /// Scan the settlement program on each Solana network that has one
+    /// configured and call a function with the aggregated results.
+    pub async fn do_with_order_stats<T>(&self, callback: T)
+    where
+        T: Fn(OrderStatsCallbackParameters),
+    {
+        for network in &self.networks {
+            let Some(program_id) = network.settlement_program_id.as_ref() else {
+                continue;
+            };
+            let Client::Solana(transport) = &network.client else {
+                unreachable!("settlement program only configured for solana networks");
+            };
+            let stats =
+                order_monitor::scan(transport, program_id, order_monitor::SCAN_TIMEOUT).await;
+            callback(OrderStatsCallbackParameters {
+                network_name: &network.name,
+                program_id,
+                stats,
+            });
+        }
+    }
 }
 
 fn create_transport(url: &Url) -> Result<DynTransport> {
@@ -115,10 +146,30 @@ fn create_network(network: config::Network) -> Result<Network> {
             (Client::Solana(transport), addresses)
         }
     };
+
+    let settlement_program_id = match network.settlement {
+        Some(config) => {
+            if network.kind != config::Kind::Solana {
+                return Err(anyhow!(
+                    "network {} is not a solana network, settlement monitoring is not supported",
+                    network.name
+                ));
+            }
+            Some(
+                config
+                    .program_id
+                    .parse()
+                    .with_context(|| "failed to parse settlement program_id")?,
+            )
+        }
+        None => None,
+    };
+
     Ok(Network {
         name: network.name,
         client,
         addresses,
+        settlement_program_id,
     })
 }
 
@@ -127,6 +178,7 @@ struct Network {
     name: String,
     client: Client,
     addresses: Vec<AddressToMonitor>,
+    settlement_program_id: Option<Pubkey>,
 }
 
 #[derive(Clone, Debug)]

@@ -1,8 +1,10 @@
 mod balance_monitor;
 mod config;
+mod order_monitor;
 
 use anyhow::Result;
 use clap::Parser;
+use cow_settlement_interface::Pubkey;
 use prometheus::Encoder as _;
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use web3::types::U256;
@@ -43,6 +45,123 @@ fn print_balance(address_name: &str, network_name: &str, token_name: &str, balan
     }
 }
 
+fn print_order_stats(network_name: &str, program_id: &Pubkey, stats: &order_monitor::Stats) {
+    println!(
+        "network {} program {}: open={}, expired={}, cancelled={}, filled={}, malformed={}; reclaimable={} lamports",
+        network_name,
+        program_id,
+        stats.counts.get(&order_monitor::Status::Open).copied().unwrap_or(0),
+        stats.counts.get(&order_monitor::Status::Expired).copied().unwrap_or(0),
+        stats.counts.get(&order_monitor::Status::Cancelled).copied().unwrap_or(0),
+        stats.counts.get(&order_monitor::Status::Filled).copied().unwrap_or(0),
+        stats.counts.get(&order_monitor::Status::Malformed).copied().unwrap_or(0),
+        stats.reclaimable,
+    );
+}
+
+fn record_balance(
+    params: &balance_monitor::CallbackParameters,
+    balance_metric: &prometheus::GaugeVec,
+    success_metric: &prometheus::IntCounterVec,
+    print_balances: bool,
+) {
+    if print_balances {
+        print_balance(
+            params.address_name,
+            params.network_name,
+            params.token_name,
+            &params.balance,
+        );
+    }
+    match &params.balance {
+        Ok(balance) => {
+            balance_metric
+                .with_label_values(&[
+                    params.address_name,
+                    params.token_name,
+                    &params.address.label(),
+                    params.tag,
+                    params.network_name,
+                ])
+                .set(u256_to_f64(*balance));
+            success_metric
+                .with_label_values(&["success", &params.address.label(), params.network_name])
+                .inc();
+        }
+        Err(err) => {
+            success_metric
+                .with_label_values(&["failure", &params.address.label(), params.network_name])
+                .inc();
+            println!(
+                "failed to get balance for address {} token {}: {}",
+                params.address.label(),
+                params.token_name,
+                err
+            );
+        }
+    }
+}
+
+fn record_order_stats(
+    params: &balance_monitor::OrderStatsCallbackParameters,
+    order_rent_metric: &prometheus::GaugeVec,
+    order_reclaimable_metric: &prometheus::GaugeVec,
+    success_metric: &prometheus::IntCounterVec,
+    print_balances: bool,
+) {
+    if print_balances {
+        match params.stats.as_ref() {
+            Ok(stats) => print_order_stats(params.network_name, params.program_id, stats),
+            Err(err) => println!(
+                "failed to scan order rent for network {} program {}: {}",
+                params.network_name, params.program_id, err
+            ),
+        }
+    }
+    let program_id_label = params.program_id.to_string();
+    match &params.stats {
+        Ok(stats) => {
+            for status in order_monitor::Status::ALL {
+                let lamports = stats.rent.get(&status).copied().unwrap_or(0);
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "prometheus gauges only accept f64"
+                )]
+                order_rent_metric
+                    .with_label_values(&[params.network_name, &program_id_label, status.as_str()])
+                    .set(lamports as f64);
+            }
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "prometheus gauges only accept f64"
+            )]
+            order_reclaimable_metric
+                .with_label_values(&[params.network_name, &program_id_label])
+                .set(stats.reclaimable as f64);
+            success_metric
+                .with_label_values(&[
+                    "success",
+                    &format!("orders:{program_id_label}"),
+                    params.network_name,
+                ])
+                .inc();
+        }
+        Err(err) => {
+            success_metric
+                .with_label_values(&[
+                    "failure",
+                    &format!("orders:{program_id_label}"),
+                    params.network_name,
+                ])
+                .inc();
+            println!(
+                "failed to scan order rent for network {} program {}: {}",
+                params.network_name, params.program_id, err
+            );
+        }
+    }
+}
+
 // Copied from ethcontract-rs.
 /// Lossy conversion from a `U256` to a `f64`.
 pub fn u256_to_f64(value: U256) -> f64 {
@@ -79,10 +198,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "etherbalance_last_update",
         "Unix time of last update of balances.",
     )?;
+    let order_rent_metric = prometheus::GaugeVec::new(
+        prometheus::Opts::new(
+            "etherbalance_order_rent_lamports",
+            "Rent held by settlement order PDAs by status.",
+        ),
+        &["network", "program_id", "status"],
+    )?;
+    let order_reclaimable_metric = prometheus::GaugeVec::new(
+        prometheus::Opts::new(
+            "etherbalance_order_reclaimable_lamports",
+            "Settlement order rent that can be reclaimed right now.",
+        ),
+        &["network", "program_id"],
+    )?;
     let registry = prometheus::Registry::new();
     registry.register(Box::new(balance_metric.clone()))?;
     registry.register(Box::new(success_metric.clone()))?;
     registry.register(Box::new(last_update_metric.clone()))?;
+    registry.register(Box::new(order_rent_metric.clone()))?;
+    registry.register(Box::new(order_reclaimable_metric.clone()))?;
 
     // http server for metrics
     let address = opt.bind;
@@ -105,51 +240,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         monitor
             .do_with_balances(|params| {
-                if print_balances {
-                    print_balance(
-                        params.address_name,
-                        params.network_name,
-                        params.token_name,
-                        &params.balance,
-                    );
-                }
-                match params.balance {
-                    Ok(balance) => {
-                        balance_metric
-                            .with_label_values(&[
-                                params.address_name,
-                                params.token_name,
-                                &params.address.label(),
-                                params.tag,
-                                params.network_name,
-                            ])
-                            .set(u256_to_f64(balance));
-                        success_metric
-                            .with_label_values(&[
-                                "success",
-                                &params.address.label(),
-                                params.network_name,
-                            ])
-                            .inc();
-                    }
-                    Err(err) => {
-                        success_metric
-                            .with_label_values(&[
-                                "failure",
-                                &params.address.label(),
-                                params.network_name,
-                            ])
-                            .inc();
-                        println!(
-                            "failed to get balance for address {} token {}: {}",
-                            params.address.label(),
-                            params.token_name,
-                            err
-                        );
-                    }
-                }
+                record_balance(&params, &balance_metric, &success_metric, print_balances);
             })
             .await;
+
+        monitor
+            .do_with_order_stats(|params| {
+                record_order_stats(
+                    &params,
+                    &order_rent_metric,
+                    &order_reclaimable_metric,
+                    &success_metric,
+                    print_balances,
+                );
+            })
+            .await;
+
         match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(duration) => last_update_metric.set(duration.as_secs_f64()),
             Err(err) => println!("system time before epoch: {}", err),

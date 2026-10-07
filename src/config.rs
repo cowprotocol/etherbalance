@@ -1,7 +1,12 @@
 use anyhow::{anyhow, Context as _, Result};
+use cow_settlement_interface::ID as SETTLEMENT_PROGRAM_ID;
 use serde::{de::Error as _, Deserialize, Deserializer};
 use std::collections::HashMap;
 use web3::types::Address;
+
+fn default_program_id() -> String {
+    SETTLEMENT_PROGRAM_ID.to_string()
+}
 
 /// Wrapper type of Address that implements deserialize from hex string.
 #[derive(Debug)]
@@ -49,6 +54,14 @@ pub enum Kind {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SettlementConfig {
+    /// Solana program ID to scan for settlement order accounts.
+    /// Defaults to the deployed `CoW` Protocol settlement program.
+    #[serde(default = "default_program_id")]
+    pub program_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Network {
     #[serde(default)]
     pub kind: Kind,
@@ -56,6 +69,8 @@ pub struct Network {
     pub url: String,
     pub tokens: HashMap<String, Address_>,
     pub addresses: HashMap<String, ConfigAddress>,
+    #[serde(default)]
+    pub settlement: Option<SettlementConfig>,
 }
 
 /// The user facing config file.
