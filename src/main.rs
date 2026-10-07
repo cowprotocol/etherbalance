@@ -23,6 +23,10 @@ struct Opt {
     #[clap(long, default_value = "100", parse(try_from_str = duration_from_seconds))]
     update_interval: Duration,
 
+    /// Scan settlement order accounts in this interval in seconds.
+    #[clap(long, default_value = "1800", parse(try_from_str = duration_from_seconds))]
+    order_scan_interval: Duration,
+
     /// Print balances to stdout on update.
     #[clap(long)]
     print_balances: bool,
@@ -259,36 +263,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // update balances
+    // The order scan is one `getProgramAccounts` per network, which providers
+    // rate limit and charge extra for, and reclaimable rent only changes when
+    // orders expire or get reclaimed. So it runs on a longer interval than the
+    // balance updates.
     let print_balances = opt.print_balances;
-    loop {
-        tokio::join!(
-            monitor.do_with_balances(|params| {
-                record_balance(&params, &balance_metric, &success_metric, print_balances);
-            }),
-            monitor.do_with_order_stats(|params| {
-                record_order_stats(
-                    &params,
-                    &order_count_metric,
-                    &order_rent_metric,
-                    &order_reclaimable_metric,
-                    &order_last_success_metric,
-                    &success_metric,
-                    print_balances,
-                );
-            }),
-        );
+    let update_interval = opt.update_interval;
+    let order_scan_interval = opt.order_scan_interval;
+    tokio::join!(
+        async {
+            loop {
+                monitor
+                    .do_with_balances(|params| {
+                        record_balance(&params, &balance_metric, &success_metric, print_balances);
+                    })
+                    .await;
 
-        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(duration) => last_update_metric.set(duration.as_secs_f64()),
-            Err(err) => println!("system time before epoch: {}", err),
-        };
-        // Retrieving the balances takes some time so sleeping for
-        // update_interval makes us actually update the balances less frequently
-        // than update_interval. We could be more accurate and sleep the exact
-        // time needed. In practice it does not matter.
-        tokio::time::sleep(opt.update_interval).await;
-    }
+                match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                    Ok(duration) => last_update_metric.set(duration.as_secs_f64()),
+                    Err(err) => println!("system time before epoch: {}", err),
+                };
+                // Retrieving the balances takes some time so sleeping for
+                // update_interval makes us actually update the balances less
+                // frequently than update_interval. We could be more accurate and
+                // sleep the exact time needed. In practice it does not matter.
+                tokio::time::sleep(update_interval).await;
+            }
+        },
+        async {
+            loop {
+                monitor
+                    .do_with_order_stats(|params| {
+                        record_order_stats(
+                            &params,
+                            &order_count_metric,
+                            &order_rent_metric,
+                            &order_reclaimable_metric,
+                            &order_last_success_metric,
+                            &success_metric,
+                            print_balances,
+                        );
+                    })
+                    .await;
+
+                tokio::time::sleep(order_scan_interval).await;
+            }
+        },
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]

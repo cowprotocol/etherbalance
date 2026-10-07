@@ -12,10 +12,11 @@ FLAGS:
     -V, --version           Prints version information
 
 OPTIONS:
-        --bind <bind>                          Serve the prometheus metrics at this address [default: 0.0.0.0:8080]
-        --config <config>                      Path to the config file
-        --node <node>                          Url of the ethereum node to communicate with
-        --update-interval <update-interval>    Update the balances in this interval in seconds [default: 100]
+        --bind <bind>                                  Serve the prometheus metrics at this address [default: 0.0.0.0:8080]
+        --config <config>                              Path to the config file
+        --node <node>                                  Url of the ethereum node to communicate with
+        --order-scan-interval <order-scan-interval>    Scan settlement order accounts in this interval in seconds [default: 1800]
+        --update-interval <update-interval>            Update the balances in this interval in seconds [default: 100]
 ```
 
 The balance information is exposed as a prometheus metric at `/metrics`. With the example config file:
@@ -52,8 +53,11 @@ Prometheus metrics because we want to avoid overloading the ethereum node.
 # Solana settlement order rent monitoring
 
 For Solana networks an optional `[networks.settlement]` section scans all order
-PDAs of the CoW Protocol settlement program once per cycle, classifies each
-order, and exports the aggregated rent.
+PDAs of the CoW Protocol settlement program, classifies each order, and exports
+the aggregated rent. The scan runs on its own interval, set with
+`--order-scan-interval` (default 1800 seconds), because it is one
+`getProgramAccounts` call per network and reclaimable rent only changes when
+orders expire or get reclaimed.
 
 Each order is placed in exactly one of these exclusive statuses, in this
 precedence:
@@ -95,7 +99,7 @@ cancelled or filled.
 
 A tokio timeout of 120 seconds caps each scan; on timeout the failure is logged,
 the success counter is incremented with `result="failure"`, and the previous
-metric values are left in place until the next cycle. Because
+metric values are left in place until the next scan. Because
 `etherbalance_order_last_success` only advances on a successful scan, staleness
 alerts can key on it directly.
 
