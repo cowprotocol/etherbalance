@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -49,10 +49,10 @@ impl Status {
 
 #[derive(Debug, Default)]
 pub struct Stats {
-    /// Number of order PDAs classified into each status.
-    pub counts: HashMap<Status, u64>,
-    /// Sum of rent lamports held by order PDAs of each status.
-    pub rent: HashMap<Status, u64>,
+    /// Number of order PDAs classified into each status, indexed by `status as usize`.
+    pub counts: [u64; 5],
+    /// Sum of rent lamports held by order PDAs of each status, indexed like `counts`.
+    pub rent: [u64; 5],
     /// Sum of lamports that the `ReclaimOrder` instruction could recover now.
     pub reclaimable: u64,
 }
@@ -60,16 +60,12 @@ pub struct Stats {
 /// One entry of a `getProgramAccounts` response.
 #[derive(Debug, Deserialize)]
 struct PubkeyAccount {
-    #[allow(dead_code)]
-    pubkey: String,
     account: RpcAccount,
 }
 
 #[derive(Debug, Deserialize)]
 struct RpcAccount {
     data: (String, String),
-    #[allow(dead_code)]
-    owner: String,
     lamports: u64,
 }
 
@@ -92,6 +88,7 @@ where
     let program_id_param = json!(program_id.to_string());
     let config_param = json!({
         "encoding": "base64",
+        "commitment": "confirmed",
         "filters": [{
             "memcmp": {
                 "offset": 0,
@@ -110,12 +107,13 @@ where
 
     let mut stats = Stats::default();
     for entry in entries {
-        let data = BASE64
-            .decode(&entry.account.data.0)
-            .context("failed to base64-decode account data")?;
-        let (order_status, reclaimable) = classify(&data, now);
-        *stats.counts.entry(order_status).or_default() += 1;
-        *stats.rent.entry(order_status).or_default() += entry.account.lamports;
+        let (order_status, reclaimable) = match BASE64.decode(&entry.account.data.0) {
+            Ok(data) => classify(&data, now),
+            Err(_) => (Status::Malformed, false),
+        };
+        let index = order_status as usize;
+        stats.counts[index] += 1;
+        stats.rent[index] += entry.account.lamports;
         if reclaimable {
             stats.reclaimable += entry.account.lamports;
         }
@@ -139,21 +137,22 @@ where
     )
     .context("unexpected getSlot response")?;
 
-    let block_time: Option<i64> = serde_json::from_value(
-        transport
-            .execute("getBlockTime", vec![json!(slot)])
-            .await
-            .context("getBlockTime RPC call failed")?,
-    )
-    .context("unexpected getBlockTime response")?;
+    // Skipped or not-yet-available slots usually come back as an RPC error
+    // rather than `null`, so treat both as "no block time".
+    let block_time = match transport.execute("getBlockTime", vec![json!(slot)]).await {
+        Ok(value) => serde_json::from_value::<Option<i64>>(value)
+            .context("unexpected getBlockTime response")?,
+        Err(_) => None,
+    };
 
-    Ok(block_time.unwrap_or_else(|| {
-        let seconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before epoch")
-            .as_secs();
-        i64::try_from(seconds).unwrap_or(i64::MAX)
-    }))
+    if let Some(block_time) = block_time {
+        return Ok(block_time);
+    }
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time before epoch")?
+        .as_secs();
+    Ok(i64::try_from(seconds).unwrap_or(i64::MAX))
 }
 
 /// Classify an order body into a single exclusive status and whether it is
@@ -215,7 +214,7 @@ mod tests {
             flags,
             ..sample_intent(flags)
         };
-        let mut bytes = [0u8; 264];
+        let mut bytes = [0u8; cow_settlement_interface::data::order::SIZE];
         OrderAccount::initialize(
             &mut bytes[..],
             0,
@@ -230,11 +229,7 @@ mod tests {
     }
 
     fn sell_intent() -> OrderIntent {
-        sample_intent(Flags {
-            created_on_chain: false,
-            kind: OrderKind::Sell,
-            partially_fillable: true,
-        })
+        sample_intent(sell_flags())
     }
 
     fn sell_flags() -> Flags {
@@ -298,16 +293,12 @@ mod tests {
 
     #[test]
     fn buy_kind_fill_uses_received_amount() {
-        let intent = sample_intent(Flags {
-            created_on_chain: false,
-            kind: OrderKind::Buy,
-            partially_fillable: true,
-        });
         let flags = Flags {
             created_on_chain: false,
             kind: OrderKind::Buy,
             partially_fillable: true,
         };
+        let intent = sample_intent(flags);
         let data = order_bytes(100, flags, false, 0, intent.buy_amount);
         let (status, reclaimable) = classify(&data, 50);
         assert_eq!(status, Status::Filled);
@@ -324,7 +315,7 @@ mod tests {
     #[test]
     fn malformed_bad_cancelled_byte() {
         let mut bytes = sample_order_bytes(false).to_vec();
-        bytes[2] = 2;
+        bytes[cow_settlement_interface::data::order::fixtures::CANCELLED_OFFSET] = 2;
         let (status, reclaimable) = classify(&bytes, 50);
         assert_eq!(status, Status::Malformed);
         assert!(!reclaimable);
@@ -333,7 +324,8 @@ mod tests {
     #[test]
     fn malformed_reserved_flags_byte() {
         let mut bytes = sample_order_bytes(false).to_vec();
-        bytes[51 + cow_settlement_interface::data::intent::fixtures::FLAGS_OFFSET] = 0xff;
+        bytes[cow_settlement_interface::data::order::fixtures::INTENT_OFFSET
+            + cow_settlement_interface::data::intent::fixtures::FLAGS_OFFSET] = 0xff;
         let (status, reclaimable) = classify(&bytes, 50);
         assert_eq!(status, Status::Malformed);
         assert!(!reclaimable);

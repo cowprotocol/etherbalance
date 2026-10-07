@@ -67,6 +67,13 @@ precedence:
 The metrics are:
 
 ```
+# HELP etherbalance_order_count Number of settlement order PDAs by status.
+# TYPE etherbalance_order_count gauge
+etherbalance_order_count{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="open"} 0
+etherbalance_order_count{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="expired"} 0
+etherbalance_order_count{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="cancelled"} 0
+etherbalance_order_count{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="filled"} 0
+etherbalance_order_count{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="malformed"} 0
 # HELP etherbalance_order_rent_lamports Rent held by settlement order PDAs by status.
 # TYPE etherbalance_order_rent_lamports gauge
 etherbalance_order_rent_lamports{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="open"} 0
@@ -77,6 +84,9 @@ etherbalance_order_rent_lamports{network="solana",program_id="C7PXyLpLQBh3Ce7e9D
 # HELP etherbalance_order_reclaimable_lamports Settlement order rent that can be reclaimed right now.
 # TYPE etherbalance_order_reclaimable_lamports gauge
 etherbalance_order_reclaimable_lamports{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi"} 0
+# HELP etherbalance_order_last_success Unix time of the last successful settlement order scan.
+# TYPE etherbalance_order_last_success gauge
+etherbalance_order_last_success{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi"} 0
 ```
 
 `etherbalance_order_reclaimable_lamports` is the rent that the `ReclaimOrder`
@@ -85,7 +95,9 @@ cancelled or filled.
 
 A tokio timeout of 120 seconds caps each scan; on timeout the failure is logged,
 the success counter is incremented with `result="failure"`, and the previous
-metric values are left in place until the next cycle.
+metric values are left in place until the next cycle. Because
+`etherbalance_order_last_success` only advances on a successful scan, staleness
+alerts can key on it directly.
 
 # Development
 

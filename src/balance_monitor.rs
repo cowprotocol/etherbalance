@@ -1,6 +1,6 @@
 use crate::{config, order_monitor};
 use anyhow::{anyhow, Context, Error, Result};
-use cow_settlement_interface::Pubkey;
+use cow_settlement_interface::{Pubkey, ID as SETTLEMENT_PROGRAM_ID};
 use ethcontract::dyns::DynTransport;
 use std::{collections::HashMap, rc::Rc, str::FromStr};
 use url::Url;
@@ -155,12 +155,13 @@ fn create_network(network: config::Network) -> Result<Network> {
                     network.name
                 ));
             }
-            Some(
-                config
-                    .program_id
+            let program_id = match &config.program_id {
+                Some(program_id) => program_id
                     .parse()
-                    .with_context(|| "failed to parse settlement program_id")?,
-            )
+                    .context("failed to parse settlement program_id")?,
+                None => SETTLEMENT_PROGRAM_ID,
+            };
+            Some(program_id)
         }
         None => None,
     };

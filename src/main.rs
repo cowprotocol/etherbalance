@@ -46,16 +46,14 @@ fn print_balance(address_name: &str, network_name: &str, token_name: &str, balan
 }
 
 fn print_order_stats(network_name: &str, program_id: &Pubkey, stats: &order_monitor::Stats) {
+    let counts = order_monitor::Status::ALL
+        .iter()
+        .map(|status| format!("{}={}", status.as_str(), stats.counts[*status as usize]))
+        .collect::<Vec<_>>()
+        .join(", ");
     println!(
-        "network {} program {}: open={}, expired={}, cancelled={}, filled={}, malformed={}; reclaimable={} lamports",
-        network_name,
-        program_id,
-        stats.counts.get(&order_monitor::Status::Open).copied().unwrap_or(0),
-        stats.counts.get(&order_monitor::Status::Expired).copied().unwrap_or(0),
-        stats.counts.get(&order_monitor::Status::Cancelled).copied().unwrap_or(0),
-        stats.counts.get(&order_monitor::Status::Filled).copied().unwrap_or(0),
-        stats.counts.get(&order_monitor::Status::Malformed).copied().unwrap_or(0),
-        stats.reclaimable,
+        "network {} program {}: {}; reclaimable={} lamports",
+        network_name, program_id, counts, stats.reclaimable,
     );
 }
 
@@ -104,8 +102,10 @@ fn record_balance(
 
 fn record_order_stats(
     params: &balance_monitor::OrderStatsCallbackParameters,
+    order_count_metric: &prometheus::GaugeVec,
     order_rent_metric: &prometheus::GaugeVec,
     order_reclaimable_metric: &prometheus::GaugeVec,
+    order_last_success_metric: &prometheus::GaugeVec,
     success_metric: &prometheus::IntCounterVec,
     print_balances: bool,
 ) {
@@ -118,14 +118,20 @@ fn record_order_stats(
     match &params.stats {
         Ok(stats) => {
             for status in order_monitor::Status::ALL {
-                let lamports = stats.rent.get(&status).copied().unwrap_or(0);
                 #[expect(
                     clippy::cast_precision_loss,
                     reason = "prometheus gauges only accept f64"
                 )]
+                let (count, lamports) = (
+                    stats.counts[status as usize] as f64,
+                    stats.rent[status as usize] as f64,
+                );
+                order_count_metric
+                    .with_label_values(&[params.network_name, &program_id_label, status.as_str()])
+                    .set(count);
                 order_rent_metric
                     .with_label_values(&[params.network_name, &program_id_label, status.as_str()])
-                    .set(lamports as f64);
+                    .set(lamports);
             }
             #[expect(
                 clippy::cast_precision_loss,
@@ -134,6 +140,12 @@ fn record_order_stats(
             order_reclaimable_metric
                 .with_label_values(&[params.network_name, &program_id_label])
                 .set(stats.reclaimable as f64);
+            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => order_last_success_metric
+                    .with_label_values(&[params.network_name, &program_id_label])
+                    .set(duration.as_secs_f64()),
+                Err(err) => println!("system time before epoch: {}", err),
+            }
             success_metric
                 .with_label_values(&[
                     "success",
@@ -194,6 +206,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "etherbalance_last_update",
         "Unix time of last update of balances.",
     )?;
+    let order_count_metric = prometheus::GaugeVec::new(
+        prometheus::Opts::new(
+            "etherbalance_order_count",
+            "Number of settlement order PDAs by status.",
+        ),
+        &["network", "program_id", "status"],
+    )?;
     let order_rent_metric = prometheus::GaugeVec::new(
         prometheus::Opts::new(
             "etherbalance_order_rent_lamports",
@@ -208,12 +227,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         &["network", "program_id"],
     )?;
+    let order_last_success_metric = prometheus::GaugeVec::new(
+        prometheus::Opts::new(
+            "etherbalance_order_last_success",
+            "Unix time of the last successful settlement order scan.",
+        ),
+        &["network", "program_id"],
+    )?;
     let registry = prometheus::Registry::new();
     registry.register(Box::new(balance_metric.clone()))?;
     registry.register(Box::new(success_metric.clone()))?;
     registry.register(Box::new(last_update_metric.clone()))?;
+    registry.register(Box::new(order_count_metric.clone()))?;
     registry.register(Box::new(order_rent_metric.clone()))?;
     registry.register(Box::new(order_reclaimable_metric.clone()))?;
+    registry.register(Box::new(order_last_success_metric.clone()))?;
 
     // http server for metrics
     let address = opt.bind;
@@ -234,23 +262,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // update balances
     let print_balances = opt.print_balances;
     loop {
-        monitor
-            .do_with_balances(|params| {
+        tokio::join!(
+            monitor.do_with_balances(|params| {
                 record_balance(&params, &balance_metric, &success_metric, print_balances);
-            })
-            .await;
-
-        monitor
-            .do_with_order_stats(|params| {
+            }),
+            monitor.do_with_order_stats(|params| {
                 record_order_stats(
                     &params,
+                    &order_count_metric,
                     &order_rent_metric,
                     &order_reclaimable_metric,
+                    &order_last_success_metric,
                     &success_metric,
                     print_balances,
                 );
-            })
-            .await;
+            }),
+        );
 
         match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(duration) => last_update_metric.set(duration.as_secs_f64()),
