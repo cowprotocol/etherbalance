@@ -83,8 +83,7 @@ etherbalance_order_reclaimable_lamports{network="solana",program_id="C7PXyLpLQBh
 instruction could recover now: expired orders plus on-chain orders that are
 cancelled or filled.
 
-The order scan uses `getProgramAccounts`, which some RPC nodes handle slowly. A
-tokio timeout of 120 seconds caps each scan; on timeout the failure is logged,
+A tokio timeout of 120 seconds caps each scan; on timeout the failure is logged,
 the success counter is incremented with `result="failure"`, and the previous
 metric values are left in place until the next cycle.
 

@@ -74,9 +74,6 @@ struct RpcAccount {
 }
 
 /// Scan all settlement order PDAs and aggregate their rent by status.
-///
-/// The scan is wrapped in a tokio timeout because `getProgramAccounts` can hang
-/// on nodes that do not index it efficiently.
 pub async fn scan<T>(transport: &T, program_id: &Pubkey, timeout: Duration) -> Result<Stats>
 where
     T: Transport,
