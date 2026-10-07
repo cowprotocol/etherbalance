@@ -110,12 +110,8 @@ fn record_order_stats(
     print_balances: bool,
 ) {
     if print_balances {
-        match params.stats.as_ref() {
-            Ok(stats) => print_order_stats(params.network_name, params.program_id, stats),
-            Err(err) => println!(
-                "failed to scan order rent for network {} program {}: {}",
-                params.network_name, params.program_id, err
-            ),
+        if let Ok(stats) = &params.stats {
+            print_order_stats(params.network_name, params.program_id, stats);
         }
     }
     let program_id_label = params.program_id.to_string();
