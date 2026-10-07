@@ -44,3 +44,9 @@ url = 'https://api.mainnet-beta.solana.com'
 [networks.addresses]
 # Solana addresses are base58 encoded.
 solana-wallet = { address = "Grr6SWYUFi1eCagwEifXVD83rUQ4W5rJWYq1Lj7cx1jS", ether=true, tokens = [] }
+
+[networks.settlement]
+# Optional: scan all order PDAs of the CoW Protocol Solana settlement program
+# and expose their rent balances grouped by order status. Only valid for
+# `kind = 'solana'` networks. `program_id` defaults to the deployed program.
+program_id = 'C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi'

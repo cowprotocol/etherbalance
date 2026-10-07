@@ -49,6 +49,13 @@ pub enum Kind {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SettlementConfig {
+    /// Solana program ID to scan for settlement order accounts.
+    /// Defaults to the deployed `CoW` Protocol settlement program.
+    pub program_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Network {
     #[serde(default)]
     pub kind: Kind,
@@ -56,6 +63,7 @@ pub struct Network {
     pub url: String,
     pub tokens: HashMap<String, Address_>,
     pub addresses: HashMap<String, ConfigAddress>,
+    pub settlement: Option<SettlementConfig>,
 }
 
 /// The user facing config file.
