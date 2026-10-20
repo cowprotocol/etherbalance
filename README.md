@@ -1,7 +1,7 @@
 # etherbalance
 
 An ethereum ether and [ERC20](https://eips.ethereum.org/EIPS/eip-20) token balance monitoring application.
-It can also monitor native SOL balances on Solana networks (`kind = 'solana'`), reported in lamports with `token_name="sol"`.
+It can also monitor native SOL balances on Solana networks (`kind = 'solana'`), reported in lamports with `token_name="sol"`, and the rent held by CoW Protocol Solana settlement order accounts grouped by order status.
 
 See the [example config file](example_config.toml), and command line options (`cargo run -- --help`):
 
@@ -12,10 +12,11 @@ FLAGS:
     -V, --version           Prints version information
 
 OPTIONS:
-        --bind <bind>                          Serve the prometheus metrics at this address [default: 0.0.0.0:8080]
-        --config <config>                      Path to the config file
-        --node <node>                          Url of the ethereum node to communicate with
-        --update-interval <update-interval>    Update the balances in this interval in seconds [default: 100]
+        --bind <bind>                                  Serve the prometheus metrics at this address [default: 0.0.0.0:8080]
+        --config <config>                              Path to the config file
+        --node <node>                                  Url of the ethereum node to communicate with
+        --order-scan-interval <order-scan-interval>    Scan settlement order accounts in this interval in seconds [default: 1800]
+        --update-interval <update-interval>            Update the balances in this interval in seconds [default: 100]
 ```
 
 The balance information is exposed as a prometheus metric at `/metrics`. With the example config file:
@@ -48,6 +49,59 @@ address company-wallet usdc balance is 16234719511522
 This information is updated in the background with the specified
 `--update-interval`. It is not updated on metric request as is custom for
 Prometheus metrics because we want to avoid overloading the ethereum node.
+
+# Solana settlement order rent monitoring
+
+For Solana networks an optional `[networks.settlement]` section scans all order
+PDAs of the CoW Protocol settlement program, classifies each order, and exports
+the aggregated rent. The scan runs on its own interval, set with
+`--order-scan-interval` (default 1800 seconds), because it is one
+`getProgramAccounts` call per network and reclaimable rent only changes when
+orders expire or get reclaimed.
+
+Each order is placed in exactly one of these exclusive statuses, in this
+precedence:
+
+- `malformed` — discriminator matched but the body did not decode
+- `expired` — chain time is past `valid_to`
+- `cancelled` — `cancelled` flag is set
+- `filled` — cumulative fill reached the intent amount (kind-aware)
+- `open` — none of the above
+
+The metrics are:
+
+```
+# HELP etherbalance_order_count Number of settlement order PDAs by status.
+# TYPE etherbalance_order_count gauge
+etherbalance_order_count{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="open"} 0
+etherbalance_order_count{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="expired"} 0
+etherbalance_order_count{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="cancelled"} 0
+etherbalance_order_count{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="filled"} 0
+etherbalance_order_count{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="malformed"} 0
+# HELP etherbalance_order_rent_lamports Rent held by settlement order PDAs by status.
+# TYPE etherbalance_order_rent_lamports gauge
+etherbalance_order_rent_lamports{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="open"} 0
+etherbalance_order_rent_lamports{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="expired"} 0
+etherbalance_order_rent_lamports{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="cancelled"} 0
+etherbalance_order_rent_lamports{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="filled"} 0
+etherbalance_order_rent_lamports{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi",status="malformed"} 0
+# HELP etherbalance_order_reclaimable_lamports Settlement order rent that can be reclaimed right now.
+# TYPE etherbalance_order_reclaimable_lamports gauge
+etherbalance_order_reclaimable_lamports{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi"} 0
+# HELP etherbalance_order_last_success Unix time of the last successful settlement order scan.
+# TYPE etherbalance_order_last_success gauge
+etherbalance_order_last_success{network="solana",program_id="C7PXyLpLQBh3Ce7e9DNj3rDVUvwqa5orDwQG5hs1rfNi"} 0
+```
+
+`etherbalance_order_reclaimable_lamports` is the rent that the `ReclaimOrder`
+instruction could recover now: expired orders plus on-chain orders that are
+cancelled or filled.
+
+A tokio timeout of 120 seconds caps each scan; on timeout the failure is logged,
+the success counter is incremented with `result="failure"`, and the previous
+metric values are left in place until the next scan. Because
+`etherbalance_order_last_success` only advances on a successful scan, staleness
+alerts can key on it directly.
 
 # Development
 
